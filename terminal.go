@@ -7,11 +7,14 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type Terminal struct {
 	m         sync.Mutex
 	cfg       *Config
+	rrChan    chan rune  // raw rune
+	reChan    chan error // read error
 	outchan   chan rune
 	closed    int32
 	stopChan  chan struct{}
@@ -29,6 +32,8 @@ func NewTerminal(cfg *Config) (*Terminal, error) {
 	}
 	t := &Terminal{
 		cfg:      cfg,
+		rrChan:   make(chan rune, 1),
+		reChan:   make(chan error, 1),
 		kickChan: make(chan struct{}, 1),
 		outchan:  make(chan rune),
 		stopChan: make(chan struct{}, 1),
@@ -129,6 +134,21 @@ func (t *Terminal) ioloop() {
 	)
 
 	buf := bufio.NewReader(t.getStdin())
+	go func() {
+		for {
+			r, _, err := buf.ReadRune()
+			if err != nil {
+				if strings.Contains(err.Error(), "interrupted system call") {
+					continue
+				}
+				t.reChan <- err
+				break
+			}
+			t.rrChan <- r
+		}
+	}()
+
+loop:
 	for {
 		if !expectNextChar {
 			atomic.StoreInt32(&t.isReading, 0)
@@ -139,42 +159,45 @@ func (t *Terminal) ioloop() {
 				return
 			}
 		}
-		expectNextChar = false
-		r, _, err := buf.ReadRune()
-		if err != nil {
-			if strings.Contains(err.Error(), "interrupted system call") {
-				expectNextChar = true
-				continue
+		expectNextChar = true
+
+		var r rune
+		select {
+		case r = <-t.rrChan: // rune returned
+		case <-t.reChan: // read error
+			break loop
+		case <-time.After(100 * time.Millisecond):
+			if isEscape {
+				isEscape = false
+				t.outchan <- CharEsc
 			}
-			break
+			continue
 		}
 
-		if isEscape {
+		if isEscape { // Esc
 			isEscape = false
 			if r == CharEscapeEx {
-				expectNextChar = true
 				isEscapeEx = true
 				continue
 			}
+
 			r = escapeKey(r, buf)
-		} else if isEscapeEx {
+		} else if isEscapeEx { // Esc[
 			isEscapeEx = false
-			if key := readEscKey(r, buf); key != nil {
-				r = escapeExKey(key)
-				// offset
-				if key.typ == 'R' {
-					if _, _, ok := key.Get2(); ok {
-						select {
-						case t.sizeChan <- key.attr:
-						default:
-						}
+			key := readEscKey(r, buf)
+			r = escapeExKey(key)
+			// offset
+			if key.typ == 'R' {
+				if _, _, ok := key.Get2(); ok {
+					select {
+					case t.sizeChan <- key.attr:
+					default:
 					}
-					expectNextChar = true
-					continue
 				}
+				continue
 			}
-			if r == 0 {
-				expectNextChar = true
+
+			if r == 0 { // unrecognized Esc[ sequence
 				continue
 			}
 		}
@@ -182,10 +205,6 @@ func (t *Terminal) ioloop() {
 		expectNextChar = true
 		switch r {
 		case CharEsc:
-			if t.cfg.VimMode {
-				t.outchan <- r
-				break
-			}
 			isEscape = true
 		case CharInterrupt, CharEnter, CharCtrlJ, CharDelete:
 			expectNextChar = false
